@@ -1,4 +1,4 @@
-mr-temp
+mr-tmp
 mr-*[^go]
 *.so
 
