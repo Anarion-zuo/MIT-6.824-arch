@@ -1,0 +1,3 @@
+mr-temp
+mr-*[^go]
+*.so
