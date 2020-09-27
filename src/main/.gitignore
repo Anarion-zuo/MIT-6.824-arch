@@ -1,3 +1,7 @@
 mr-temp
 mr-*[^go]
 *.so
+
+mrsequential
+mrworker
+mrmaster
