@@ -1,18 +1,48 @@
 package mr
 
-import "log"
+import (
+	"log"
+	"time"
+)
 import "net"
 import "os"
 import "net/rpc"
 import "net/http"
 
-
 type Master struct {
 	// Your definitions here.
 
+	// map state
+	isMapped  bool
+	isMapping bool
 }
 
 // Your code here -- RPC handlers for the worker to call.
+
+func (this *Master) initMaster() {
+	this.isMapped = false
+	this.isMapping = false
+}
+
+func (this *Master) TryMap(args *ExampleArgs, reply *TryMapReply) error {
+	if this.isMapped {
+		reply.runMap = false
+		return nil
+	}
+	for this.isMapping {
+		time.Sleep(time.Duration(1) * time.Second)
+	}
+	this.isMapped = false
+	this.isMapping = true
+	reply.runMap = true
+	return nil
+}
+
+func (this *Master) MapFinished(args *ExampleArgs, reply *ExampleReply) error {
+	this.isMapping = false
+	this.isMapped = true
+	return nil
+}
 
 //
 // an example RPC handler.
@@ -23,7 +53,6 @@ func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
 	reply.Y = args.X + 1
 	return nil
 }
-
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -50,7 +79,6 @@ func (m *Master) Done() bool {
 
 	// Your code here.
 
-
 	return ret
 }
 
@@ -63,7 +91,6 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
 
 	// Your code here.
-
 
 	m.server()
 	return &m
