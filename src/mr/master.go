@@ -200,9 +200,12 @@ func (this *Master) AskTask(args *ExampleArgs, reply *TaskInfo) error {
 	// check for reduce tasks
 	reduceTask := this.reduceTaskWaiting.Pop()
 	if reduceTask != nil {
-		// distribute a reduce task
+		// an available reduce task
+		// record task begin time
 		reduceTask.SetNow()
+		// note task is running
 		this.reduceTaskRunning.Push(reduceTask)
+		// setup a reply
 		*reply = reduceTask.GenerateTaskInfo()
 		fmt.Printf("Distributing reduce task on part %v %vth file %v\n", reply.PartIndex, reply.FileIndex, reply.FileName)
 		return nil
@@ -211,9 +214,12 @@ func (this *Master) AskTask(args *ExampleArgs, reply *TaskInfo) error {
 	// check for map tasks
 	mapTask := this.mapTaskWaiting.Pop()
 	if mapTask != nil {
-		// distribute a map task
+		// an available map task
+		// record task begin time
 		mapTask.SetNow()
+		// note task is running
 		this.mapTaskRunning.Push(mapTask)
+		// setup a reply
 		*reply = mapTask.GenerateTaskInfo()
 		fmt.Printf("Distributing map task on %vth file %v\n", reply.FileIndex, reply.FileName)
 		return nil
@@ -221,6 +227,7 @@ func (this *Master) AskTask(args *ExampleArgs, reply *TaskInfo) error {
 
 	// all tasks distributed
 	if this.mapTaskRunning.Size() > 0 || this.reduceTaskRunning.Size() > 0 {
+		// must wait for new tasks
 		reply.State = TaskWait
 		return nil
 	}

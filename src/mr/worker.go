@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"time"
@@ -63,6 +64,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			workerReduce(reducef, taskInfo)
 			break
 		case TaskWait:
+			// wait for 5 seconds to requeset again
 			time.Sleep(time.Duration(time.Second * 5))
 			break
 		case TaskEnd:
@@ -159,8 +161,9 @@ func workerMap(mapf func(string, string) []KeyValue, taskInfo *TaskInfo) {
 	outFiles := make([]*os.File, nReduce)
 	fileEncs := make([]*json.Encoder, nReduce)
 	for outindex := 0; outindex < nReduce; outindex++ {
-		outname := outprefix + strconv.Itoa(outindex)
-		outFiles[outindex], _ = os.Create(outname)
+		//outname := outprefix + strconv.Itoa(outindex)
+		//outFiles[outindex], _ = os.Create(outname)
+		outFiles[outindex], _ = ioutil.TempFile("mr-tmp", "mr-tmp-*")
 		fileEncs[outindex] = json.NewEncoder(outFiles[outindex])
 	}
 
@@ -177,7 +180,11 @@ func workerMap(mapf func(string, string) []KeyValue, taskInfo *TaskInfo) {
 	}
 
 	// save as files
-	for _, file := range outFiles {
+	for outindex, file := range outFiles {
+		outname := outprefix + strconv.Itoa(outindex)
+		oldpath := filepath.Join(file.Name())
+		//fmt.Printf("temp file oldpath %v\n", oldpath)
+		os.Rename(oldpath, outname)
 		file.Close()
 	}
 	// acknowledge master
@@ -187,7 +194,7 @@ func workerMap(mapf func(string, string) []KeyValue, taskInfo *TaskInfo) {
 func workerReduce(reducef func(string, []string) string, taskInfo *TaskInfo) {
 	fmt.Printf("Got assigned reduce task on part %v\n", taskInfo.PartIndex)
 	outname := "mr-out-" + strconv.Itoa(taskInfo.PartIndex)
-	fmt.Printf("%v\n", taskInfo)
+	//fmt.Printf("%v\n", taskInfo)
 
 	// read from output files from map tasks
 
@@ -218,7 +225,8 @@ func workerReduce(reducef func(string, []string) string, taskInfo *TaskInfo) {
 
 	sort.Sort(ByKey(intermediate))
 
-	ofile, err := os.Create(outname)
+	//ofile, err := os.Create(outname)
+	ofile, err := ioutil.TempFile("mr-tmp", "mr-*")
 	if err != nil {
 		fmt.Printf("Create output file %v failed: %v\n", outname, err)
 		panic("Create file error")
@@ -241,6 +249,7 @@ func workerReduce(reducef func(string, []string) string, taskInfo *TaskInfo) {
 
 		i = j
 	}
+	os.Rename(filepath.Join(ofile.Name()), outname)
 	ofile.Close()
 	// acknowledge master
 	CallTaskDone(taskInfo)
