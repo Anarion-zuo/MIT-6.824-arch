@@ -1,0 +1,13 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="go test lab2" type="GoTestRunConfiguration" factoryName="Go Test">
+    <module name="6.824lab" />
+    <working_directory value="$PROJECT_DIR$/src/raft" />
+    <framework value="gotest" />
+    <kind value="FILE" />
+    <package value="raft" />
+    <directory value="$PROJECT_DIR$/src/raft" />
+    <filePath value="$PROJECT_DIR$/src/raft/test_test.go" />
+    <output_directory value="$PROJECT_DIR$/src/raft" />
+    <method v="2" />
+  </configuration>
+</component>

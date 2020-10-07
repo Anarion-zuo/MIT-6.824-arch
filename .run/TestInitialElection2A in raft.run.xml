@@ -1,0 +1,12 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="TestInitialElection2A in raft" type="GoTestRunConfiguration" factoryName="Go Test" folderName="lab2a">
+    <module name="6.824lab" />
+    <working_directory value="$PROJECT_DIR$/src/raft" />
+    <framework value="gotest" />
+    <kind value="FILE" />
+    <directory value="$PROJECT_DIR$" />
+    <filePath value="$PROJECT_DIR$/src/raft/test_test.go" />
+    <pattern value="^\QTestInitialElection2A\E$" />
+    <method v="2" />
+  </configuration>
+</component>
