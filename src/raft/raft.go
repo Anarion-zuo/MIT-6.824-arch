@@ -268,7 +268,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// < 0 for not elected leader
 	// == for already accepted leader
 	if rf.votedFor < 0 || rf.votedFor == args.CandidateId {
-		if rf.commitIndex >= args.LastLogIndex {
+		if rf.commitIndex <= args.LastLogIndex {
 			reply.GrantVote = true
 			rf.timerCleared = true
 			fmt.Println(rf.PrefixPrint(), "granting vote to peer", args.CandidateId, "at term", args.Term)
@@ -980,9 +980,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartBeatWaitDuration = 120
 	rf.timerCleared = false
 
-	rf.followerCond = sync.NewCond(&sync.Mutex{})
-	rf.leaderCond = sync.NewCond(&sync.Mutex{})
-	rf.candidateCond = sync.NewCond(&sync.Mutex{})
 	rf.myState = FollowerState
 
 	go rf.Run()
