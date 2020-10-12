@@ -331,7 +331,7 @@ func MakeMaster(files []string, nReduce int) *Master {
 		mapArray = append(mapArray, &mapTask)
 	}
 	m := Master{
-		mapTaskRunning: TaskStatQueue{taskArray: mapArray},
+		mapTaskWaiting: TaskStatQueue{taskArray: mapArray},
 		nReduce:        nReduce,
 		filenames:      files,
 	}
