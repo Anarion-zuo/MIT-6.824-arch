@@ -48,8 +48,8 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	Term   int
-	Action interface{}
+	Term    int
+	Command interface{}
 }
 
 func (le *LogEntry) Apply() {
@@ -57,7 +57,7 @@ func (le *LogEntry) Apply() {
 }
 
 func (le *LogEntry) Equals(entry *LogEntry) bool {
-	return le.Term == entry.Term && le.Action == entry.Action
+	return le.Term == entry.Term && le.Command == entry.Command
 }
 
 //
@@ -214,7 +214,7 @@ func (rf *Raft) leaderTryCommit() bool {
 						continue
 					}
 					rf.applyCh <- ApplyMsg{
-						Command:      rf.logs[oldCommitIndex].Action,
+						Command:      rf.logs[oldCommitIndex].Command,
 						CommandValid: true,
 						CommandIndex: oldCommitIndex,
 					}
@@ -288,7 +288,7 @@ func (rf *Raft) dumpLog() {
 		if entryIndex == rf.commitIndex {
 			fmt.Println("commit index", entryIndex, "the following is not committed as yet")
 		}
-		fmt.Printf("term: %v action: %v\n", entry.Term, entry.Action)
+		fmt.Printf("term: %v action: %v\n", entry.Term, entry.Command)
 	}
 	dumpLock.Unlock()
 }
@@ -437,13 +437,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.commitIndex = len(rf.logs) - 1
 		}
 		for ; oldCommitIndex <= rf.commitIndex; oldCommitIndex++ {
-			if oldCommitIndex == -1 {
+			if oldCommitIndex == 0 {
 				continue
 			}
 			rf.applyCh <- ApplyMsg{
 				CommandIndex: oldCommitIndex,
 				CommandValid: true,
-				Command:      rf.logs[oldCommitIndex].Action,
+				Command:      rf.logs[oldCommitIndex].Command,
 			}
 		}
 
@@ -534,8 +534,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.logMutex.Lock()
 	index = len(rf.logs)
 	rf.logs = append(rf.logs, LogEntry{
-		Action: command,
-		Term:   rf.currentTerm,
+		Command: command,
+		Term:    rf.currentTerm,
 	})
 	for peerIndex := 0; peerIndex < len(rf.nextIndex); peerIndex++ {
 		rf.nextIndex[peerIndex] = len(rf.logs)
@@ -1186,19 +1186,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		me:        me,
 		applyCh:   applyCh,
 
-		commitIndex: -1,
-		lastApplied: -1,
+		commitIndex: 0,
+		lastApplied: 0,
 		nextIndex:   make([]int, len(peers)),
 		matchIndex:  make([]int, len(peers)),
-		logs:        make([]LogEntry, 0),
+		logs:        make([]LogEntry, 1),
 
 		appendEntriesChan: make(chan *AsyncRpcInfo),
 		requestVoteChan:   make(chan *AsyncRpcInfo),
 	}
 
+	// first log entry serves uselessly
+	rf.logs[0] = LogEntry{
+		Term:    -1,
+		Command: 0,
+	}
+	// set to 0 as the paper says
 	for peerIndex := 0; peerIndex < len(peers); peerIndex++ {
 		rf.nextIndex[peerIndex] = 0
-		rf.matchIndex[peerIndex] = -1
+		rf.matchIndex[peerIndex] = 0
 	}
 
 	// initialize from state persisted before a crash
