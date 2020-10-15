@@ -203,6 +203,10 @@ func (rf *Raft) leaderTryCommit(info *AsyncRpcInfo) {
 			fmt.Println(rf.PrefixPrint(), "commit index", rf.commitIndex, "reached the end of log, no need to commit, log length", len(rf.logs))
 			break
 		}
+		if info.AliveCount+1 <= info.TotalCount/2 {
+			fmt.Println(rf.PrefixPrint(), "too few followers #alive", info.AliveCount, "comparing to #total", info.TotalCount)
+			break
+		}
 		trueCount := 0
 		for peerIndex, matchIndex := range rf.matchIndex {
 			if peerIndex == rf.me {
@@ -295,6 +299,7 @@ func (rf *Raft) dumpLog() {
 			fmt.Println("----------------------------------- commit index", entryIndex)
 		}
 	}
+	fmt.Println("dump end")
 	dumpLock.Unlock()
 }
 
