@@ -8,21 +8,19 @@ package raft
 // rf = Make(...)
 //   create a new Raft server.
 // rf.Start(command interface{}) (index, term, isleader)
-//   start agreement on a new log entry
+//   start agreement on a new Log entry
 // rf.GetState() (term, isLeader)
 //   ask a Raft for its current term, and whether it thinks it is leader
 // ApplyMsg
-//   each time a new entry is committed to the log, each Raft peer
+//   each time a new entry is committed to the Log, each Raft peer
 //   should send an ApplyMsg to the service (or tester)
 //   in the same server.
 //
 
 import (
 	"fmt"
-	"math/rand"
 	"strconv"
 	"sync"
-	"time"
 )
 import "sync/atomic"
 import "labrpc"
@@ -31,11 +29,11 @@ import "labrpc"
 // import "../labgob"
 
 //
-// as each Raft peer becomes aware that successive log entries are
+// as each Raft peer becomes aware that successive Log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
 // CommandValid to true to indicate that the ApplyMsg contains a newly
-// committed log entry.
+// committed Log entry.
 //
 // in Lab 3 you'll want to send other kinds of messages (e.g.,
 // snapshots) on the applyCh; at that point you can add fields to
@@ -47,17 +45,8 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
-type LogEntry struct {
-	Term    int
-	Command interface{}
-}
-
 func (le *LogEntry) Apply() {
 
-}
-
-func (le *LogEntry) Equals(entry *LogEntry) bool {
-	return le.Term == entry.Term && le.Command == entry.Command
 }
 
 //
@@ -70,7 +59,6 @@ const (
 )
 
 type Raft struct {
-	applyCh   chan ApplyMsg
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
@@ -81,31 +69,40 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	myState       int
-	followerCond  *sync.Cond
-	leaderCond    *sync.Cond
-	candidateCond *sync.Cond
-
 	currentTerm int
 	votedFor    int
 
-	// logs
-	logMutex    sync.Mutex // lock for the following 3 members
-	applyCond   *sync.Cond
-	logs        []LogEntry
-	commitIndex int // init 0
-	lastApplied int // init 0
-	nextIndex   []int
-	matchIndex  []int // init 0
+	taskQueue *RaftTaskQueue
+
+	MyState RaftState
+	Log     *RaftLog
+
+	// other peer states
+	peerLogStates PeerLogStates
 
 	// wait duration parameters in ms
-	electWaitDuration     int
-	heartBeatWaitDuration int
-	timerCleared          bool
+	TimeParams *RaftTime
+}
 
-	// heartbeat response
-	appendEntriesChan chan *AsyncRpcInfo
-	requestVoteChan   chan *AsyncRpcInfo
+func NewRaft(applyCh chan ApplyMsg, peers []*labrpc.ClientEnd, persister *Persister, me int, timeParams *RaftTime) *Raft {
+	peerCount := len(peers)
+	ret := &Raft{
+		peers:     peers,
+		persister: persister,
+		me:        me,
+		//dead:
+
+		currentTerm: 0,
+		votedFor:    -1, // voted for no one
+		taskQueue:   NewRaftTaskQueue(),
+		MyState:     NewFollowerState(nil),
+		Log:         NewRaftLog(applyCh),
+
+		peerLogStates: NewPeerLogStates(peerCount),
+		TimeParams:    timeParams,
+	}
+	ret.MyState = NewFollowerState(ret)
+	return ret
 }
 
 // return currentTerm and whether this server
@@ -113,7 +110,7 @@ type Raft struct {
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 
-	return rf.currentTerm, rf.myState == LeaderState
+	return rf.currentTerm, rf.MyState.IsLeader()
 }
 
 //
@@ -154,21 +151,26 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-func (rf *Raft) setState(state int) {
-	rf.myState = state
+/*
+	ToString info
+*/
+func (rf *Raft) PrefixString() string {
+	return "[" + "id " + strconv.Itoa(rf.me) + " " + rf.MyState.ToString() + " term " + strconv.Itoa(rf.currentTerm) + " votedFor " + strconv.Itoa(rf.votedFor) + " " + rf.Log.InfoString() + "]"
 }
 
-func (rf *Raft) followPeer(peerId int) {
-	rf.myState = FollowerState
-	rf.votedFor = peerId
-	rf.timerCleared = true
+func (rf *Raft) printInfo(strings ...interface{}) {
+	fmt.Println(rf.PrefixString(), strings)
+}
+
+func (rf *Raft) PeerCount() int {
+	return len(rf.peers)
 }
 
 func (rf *Raft) tryFollowNewerTerm(candidateId int, newTerm int) bool {
 	if rf.currentTerm < newTerm {
 		//fmt.Println(rf.PrefixPrint(), "sees newer term", newTerm, "from peer", candidateId)
 		rf.currentTerm = newTerm
-		rf.followPeer(candidateId)
+		rf.toFollower(candidateId)
 		return true
 	}
 	return false
@@ -182,164 +184,49 @@ func (rf *Raft) tryDiscardOldTerm(peerId int, oldTerm int) bool {
 	return false
 }
 
-func (rf *Raft) applyWorker() {
+func (rf *Raft) TryCommit(call *AppendEntriesCall) {
+	rf.Log.Lock()
+	rf.peerLogStates.Lock()
 	for {
-		rf.logMutex.Lock()
-		for rf.commitIndex <= rf.lastApplied {
-			rf.applyCond.Wait()
-		}
-		rf.lastApplied++
-		rf.logs[rf.lastApplied].Apply()
-		rf.logMutex.Unlock()
-	}
-}
-
-func (rf *Raft) leaderTryCommit(info *AsyncRpcInfo) {
-	rf.logMutex.Lock()
-	for {
-		testCommitIndex := rf.commitIndex + 1
-		fmt.Println(rf.PrefixPrint(), "trying to commit index", rf.commitIndex)
-		if testCommitIndex >= len(rf.logs) {
-			fmt.Println(rf.PrefixPrint(), "commit index", rf.commitIndex, "reached the end of log, no need to commit, log length", len(rf.logs))
+		testCommitIndex := rf.Log.CommitIndex + 1
+		if testCommitIndex >= rf.Log.Length() {
 			break
 		}
-		if info.AliveCount+1 <= info.TotalCount/2 {
-			fmt.Println(rf.PrefixPrint(), "too few followers #alive", info.AliveCount, "comparing to #total", info.TotalCount)
+		if call.AliveCount+1 <= call.TotalCount/2 {
 			break
 		}
 		trueCount := 0
-		for peerIndex, matchIndex := range rf.matchIndex {
+		for peerIndex, matchIndex := range rf.peerLogStates.matchIndex {
 			if peerIndex == rf.me {
 				trueCount++
 				continue
 			}
-			if info.AliveHosts[peerIndex] {
+			if call.AliveHosts[peerIndex] {
 				// this host is alive
 				if matchIndex >= testCommitIndex {
 					trueCount++
 				}
 			}
 		}
-		if trueCount <= info.AliveCount/2 {
-			fmt.Println(rf.PrefixPrint(), "no majority state for index", rf.commitIndex, "to be committed, match index", rf.matchIndex, "next index", rf.nextIndex, "#count", trueCount, "#alive", info.AliveCount)
+		if trueCount <= call.AliveCount/2 {
 			break
 		}
-		if rf.logs[testCommitIndex].Term != rf.currentTerm {
-			fmt.Println(rf.PrefixPrint(), "commit index", rf.commitIndex, "next log index", testCommitIndex, "is at term", rf.logs[testCommitIndex].Term, " not this term", rf.currentTerm)
+		if rf.Log.Index(testCommitIndex).Term != rf.currentTerm {
 			// discard uncommitted logs
-			rf.logs = rf.logs[:testCommitIndex]
-			// reset nextIndex
-			for peerIndex := 0; peerIndex < len(rf.nextIndex); peerIndex++ {
-				if rf.nextIndex[peerIndex] >= testCommitIndex {
-					rf.nextIndex[peerIndex] = rf.commitIndex
+			rf.Log.RemoveAt(testCommitIndex)
+			// reset NextIndex
+			for peerIndex := 0; peerIndex < rf.PeerCount(); peerIndex++ {
+				if rf.peerLogStates.NextIndex[peerIndex] >= testCommitIndex {
+					rf.peerLogStates.NextIndex[peerIndex] = rf.Log.CommitIndex
 				}
 			}
 			break
 		}
-		rf.commitIndex = testCommitIndex
-		rf.applyCh <- ApplyMsg{
-			Command:      rf.logs[rf.commitIndex].Command,
-			CommandValid: true,
-			CommandIndex: rf.commitIndex,
-		}
-		fmt.Println(rf.PrefixPrint(), "log committed to index", testCommitIndex)
+		rf.Log.CommitIndex = testCommitIndex
+		rf.Log.applyCh <- rf.Log.Index(rf.Log.CommitIndex).ToApplyMsg(rf.Log.CommitIndex)
 	}
-	rf.logMutex.Unlock()
-	rf.applyCond.Broadcast()
-}
-
-func (rf *Raft) selfPrint() string {
-	return "Peer " + strconv.Itoa(rf.me)
-}
-
-func (rf *Raft) statePrint() string {
-	switch rf.myState {
-	case LeaderState:
-		return "Leader"
-	case FollowerState:
-		return "Follower"
-	case CandidateState:
-		return "Candidate"
-	}
-	return "Unknown"
-}
-
-func (rf *Raft) termPrint() string {
-	return strconv.Itoa(rf.currentTerm)
-}
-
-func (rf *Raft) logLengthPrint() string {
-	return strconv.Itoa(len(rf.logs))
-}
-
-func (rf *Raft) commitIndexPrint() string {
-	return strconv.Itoa(rf.commitIndex)
-}
-
-func (rf *Raft) PrefixPrint() string {
-	return "[" + rf.selfPrint() + " " + rf.statePrint() + " term " + rf.termPrint() + " log length " + rf.logLengthPrint() + " commit index " + rf.commitIndexPrint() + "]"
-}
-
-func (rf *Raft) callAsync(callback interface{}, peerId int, rpcName string, args interface{}, reply interface{}, xargs ...interface{}) {
-	go func() {
-		ok := rf.peers[peerId].Call(rpcName, args, reply)
-		callback.(func(*Raft, bool, int, interface{}, interface{}, ...interface{}))(rf, ok, peerId, args, reply, xargs)
-	}()
-}
-
-var dumpLock sync.Mutex
-
-func (rf *Raft) dumpLog() {
-	dumpLock.Lock()
-	fmt.Println(rf.PrefixPrint(), "dumping log", len(rf.logs))
-	fmt.Println("log length", len(rf.logs), "commit index", rf.commitIndex, "nextIndex", rf.nextIndex, "matchIndex", rf.matchIndex)
-	for entryIndex, entry := range rf.logs {
-		fmt.Printf("%v term: %v action: %v\n", entryIndex, entry.Term, entry.Command)
-		if entryIndex == rf.commitIndex {
-			fmt.Println("----------------------------------- commit index", entryIndex)
-		}
-	}
-	fmt.Println("dump end")
-	dumpLock.Unlock()
-}
-
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
-}
-
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RequestVoteReply struct {
-	// Your data here (2A).
-	GrantVote bool
-	Term      int
-}
-
-type AppendEntriesArgs struct {
-	// machine state
-	Term     int
-	LeaderId int
-	// log state
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []LogEntry
-	//entries
-	LeaderCommit int
-}
-
-type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	rf.peerLogStates.Unlock()
+	rf.Log.Unlock()
 }
 
 //
@@ -348,135 +235,15 @@ type AppendEntriesReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 
-	// default reply state
-	reply.Term = rf.currentTerm
-	reply.GrantVote = false
-	rf.timerCleared = true
-
-	if rf.tryDiscardOldTerm(args.CandidateId, args.Term) {
-		reply.GrantVote = false
-		return
-	}
-	if rf.tryFollowNewerTerm(args.CandidateId, args.Term) {
-		reply.GrantVote = true
-		return
-	}
-
-	// < 0 for not elected leader
-	// == for already accepted leader
-	if rf.votedFor < 0 || rf.votedFor == args.CandidateId {
-		// check up-to-date
-		if rf.logs[len(rf.logs)-1].Term > args.LastLogTerm {
-			// this peer has more up-to-date log
-			return
-		}
-		if rf.logs[len(rf.logs)-1].Term < args.LastLogTerm {
-			// that peer has more up-to-date log
-			reply.GrantVote = true
-			return
-		}
-		// Term attribute equals, comparing length
-		if args.LastLogIndex < len(rf.logs)-1 {
-			// this peer is more up-to-date
-			return
-		}
-		reply.GrantVote = true
-		return
-	}
-	//fmt.Println(rf.PrefixPrint(), "with leader", rf.votedFor, "at term %v not granting vote to peer", rf.currentTerm, "at term", args.Term)
+	RunTask(NewRequestVoteTask(rf, args, reply), rf.taskQueue)
+	return
 }
 
-// A non-leader should receive this
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	//fmt.Println(rf.PrefixPrint(), "got heartbeat message from leader peer", args.LeaderId, "at term", args.Term)
-	// default reply state
-	reply.Term = rf.currentTerm
-	reply.Success = true
-	rf.timerCleared = true
+	// Your code here (2A, 2B).
 
-	if rf.tryDiscardOldTerm(args.LeaderId, args.Term) {
-		reply.Success = false
-		return
-	}
-	if rf.tryFollowNewerTerm(args.LeaderId, args.Term) {
-		reply.Success = true
-		return
-	}
-	// check log info
-	if args.PrevLogIndex >= len(rf.logs) {
-		reply.Success = false
-		fmt.Println(rf.PrefixPrint(), "got new log index", args.PrevLogIndex+1, "too large for this peer's log length", len(rf.logs))
-		return
-	} else {
-		if args.PrevLogIndex != -1 {
-			if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
-				reply.Success = false
-				fmt.Println(rf.PrefixPrint(), "log entry on PrevLogIndex term inconsistent")
-				return
-			}
-		}
-	}
-	for argsEntryIndex := 0; argsEntryIndex < len(args.Entries); {
-		newEntryIndex := argsEntryIndex + args.PrevLogIndex + 1
-		if newEntryIndex < len(rf.logs) {
-			oldEntry := &rf.logs[newEntryIndex]
-			newEntry := &args.Entries[argsEntryIndex]
-			// existing log
-			// check for conflict
-			if oldEntry.Equals(newEntry) {
-				// consistent!
-				argsEntryIndex++
-			} else {
-				// inconsistent!
-				// delete everything after current index
-				rf.logs = rf.logs[:newEntryIndex]
-				fmt.Println(rf.PrefixPrint(), "inconsistent with leader at log index", newEntryIndex, "removing from then on")
-			}
-		} else {
-			// new log
-			// append everything
-			rf.logs = append(rf.logs, args.Entries[argsEntryIndex:]...)
-			break
-		}
-	}
-	if args.LeaderCommit > rf.commitIndex {
-		oldCommitIndex := rf.commitIndex
-		if args.LeaderCommit < len(rf.logs)-1 {
-			rf.commitIndex = args.LeaderCommit
-		} else {
-			rf.commitIndex = len(rf.logs) - 1
-		}
-		for ; oldCommitIndex <= rf.commitIndex; oldCommitIndex++ {
-			if oldCommitIndex == 0 {
-				continue
-			}
-			rf.applyCh <- ApplyMsg{
-				CommandIndex: oldCommitIndex,
-				CommandValid: true,
-				Command:      rf.logs[oldCommitIndex].Command,
-			}
-		}
-
-	}
-	fmt.Println(rf.PrefixPrint(), "got", len(args.Entries), "new log entries from leader peer", args.LeaderId, "committed index", rf.commitIndex)
-
-	switch rf.myState {
-	case LeaderState:
-		break
-	case FollowerState:
-		break
-	case CandidateState:
-		rf.myState = FollowerState
-		rf.currentTerm = args.Term
-		rf.votedFor = args.LeaderId
-		reply.Success = true
-		fmt.Println(rf.PrefixPrint(), "set leader to peer", args.LeaderId, "by heartbeat message")
-		break
-	default:
-		panic("Invalid peer state in rpc AppendEntries!")
-	}
-
-	//rf.mu.Unlock()
+	RunTask(NewAppendEntriesTask(rf, args, reply), rf.taskQueue)
+	return
 }
 
 //
@@ -520,10 +287,10 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
+// agreement on the next command to be appended to Raft's Log. if this
 // server isn't the leader, returns false. otherwise start the
 // agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
+// command will ever be committed to the Raft Log, since the leader
 // may fail or lose an election. even if the Raft instance has been killed,
 // this function should return gracefully.
 //
@@ -533,37 +300,38 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
 
 	// Your code here (2B).
 
-	if rf.myState != LeaderState || rf.killed() {
+	rf.LockPeerState()
+	if (!rf.MyState.IsLeader()) || rf.killed() {
+		rf.UnlockPeerState()
 		return -1, -1, false
 	}
 
-	rf.logMutex.Lock()
-	index = len(rf.logs)
-	rf.logs = append(rf.logs, LogEntry{
+	rf.Log.Lock()
+	index := rf.Log.Length()
+	rf.Log.Append(LogEntry{
 		Command: command,
 		Term:    rf.currentTerm,
 	})
-	for peerIndex := 0; peerIndex < len(rf.nextIndex); peerIndex++ {
-		rf.nextIndex[peerIndex] = len(rf.logs) - 1
+	rf.Log.Unlock()
+
+	rf.peerLogStates.Lock()
+	for peerIndex := 0; peerIndex < rf.PeerCount(); peerIndex++ {
+		rf.peerLogStates.NextIndex[peerIndex] = index
 	}
+	rf.peerLogStates.Unlock()
+
 	term := rf.currentTerm
-	isLeader := rf.myState == LeaderState
-	rf.logMutex.Unlock()
-	fmt.Println(rf.PrefixPrint(), "got new log entry, making log #", len(rf.logs))
+	isLeader := rf.MyState.IsLeader()
+
+	rf.UnlockPeerState()
+	rf.Log.cond.Broadcast()
+
+	rf.printInfo("got 1 new command", command)
 
 	return index, term, isLeader
-}
-
-func (rf *Raft) setLeaderNextIndex() {
-	rf.logMutex.Lock()
-	for peerIndex := 0; peerIndex < len(rf.nextIndex); peerIndex++ {
-		rf.nextIndex[peerIndex] = len(rf.logs)
-	}
-	rf.logMutex.Unlock()
 }
 
 //
@@ -580,8 +348,8 @@ func (rf *Raft) setLeaderNextIndex() {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	fmt.Println(rf.PrefixPrint(), "killed by an outer caller")
-	rf.dumpLog()
+	rf.printInfo("killed by outer caller")
+	rf.Log.dump()
 }
 
 func (rf *Raft) killed() bool {
@@ -589,504 +357,26 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-/*
-func (rf *Raft) runElect() {
-	// must wait for a little while
-	if rf.myState != CandidateState {
-		return
-	}
-	maxRandTime := 500
-	minRandTime := 0
-	randTime := rand.Intn(maxRandTime - minRandTime) + minRandTime
-	//if randTime > (maxRandTime + minRandTime) / 2 {
-	//	maxRandTime = randTime
-	//} else {
-	//	minRandTime = randTime
-	//}
-	fmt.Println(rf.PrefixPrint(), "running as Candidate electing in", randTime, "ms")
-	//fmt.Printf("Peer %v running as Candidate electing", rf.me)
-	time.Sleep(time.Duration(randTime) * time.Millisecond)
-	if rf.myState != CandidateState {
-		return
-	}
-
-	rf.currentTerm++
-	//rf.votedFor = rf.me
-
-	fmt.Println(rf.PrefixPrint(), "issuing election")
-
-	//rf.mu.Lock()
-
-	args := &RequestVoteArgs{
-		Term:         rf.currentTerm,
-		CandidateId:  rf.me,
-		LastLogIndex: rf.commitIndex,
-		LastLogTerm:  0,
-	}
-
-	//rf.mu.Unlock()
-
-	replyArray := make([]RequestVoteReply, len(rf.peers))
-	aliveCount := 0
-	voteCount := 0
-	for peerIndex, _ := range rf.peers {
-		if peerIndex == rf.me {
-			// does not send to myself
-			continue
-		}
-		if rf.myState != CandidateState {
-			return
-		}
-		fmt.Println(rf.PrefixPrint(), "requesting vote from peer", peerIndex)
-		if rf.sendRequestVote(peerIndex, args, &replyArray[peerIndex]) {
-			aliveCount++
-			if rf.tryFollowNewerTerm(peerIndex, replyArray[peerIndex].Term) {
-				return
-			}
-			if replyArray[peerIndex].GrantVote {
-				fmt.Println(rf.PrefixPrint(), "granted a vote by peer", peerIndex)
-				voteCount++
-			}
-		} else {
-			fmt.Println(rf.PrefixPrint(), "cannot reach peer", peerIndex, "when requesting a vote")
-		}
-	}
-	// account for itself
-	aliveCount++
-	voteCount++
-	if rf.myState != CandidateState {
-		return
-	}
-	fmt.Println(rf.PrefixPrint(), "got", voteCount, "votes in", aliveCount, "alive peers")
-	if voteCount > aliveCount / 2 && aliveCount != 1 {
-		fmt.Println(rf.PrefixPrint(), "elected leader at term", rf.currentTerm)
-		// leader claimed!
-		//rf.mu.Lock()
-		rf.myState = LeaderState
-		rf.votedFor = rf.me
-		//rf.mu.Unlock()
-		return
-	}
-	// stay as candidate for the next election or other's vote
-	//rf.mu.Lock()
-	rf.myState = CandidateState
-	rf.votedFor = -1
-
-
-	//rf.mu.Unlock()
-}
-*/
-
-type AsyncRpcInfo struct {
-	AliveCount   int
-	SuccessCount int
-	TotalCount   int
-	CurrentCount int
-	AliveHosts   []bool
-
-	Cond     *sync.Cond
-	MustExit bool
-}
-
-func (ri *AsyncRpcInfo) IncrementAliveCount() {
-	ri.Cond.L.Lock()
-	if !ri.MustExit {
-		ri.AliveCount++
-	}
-	ri.Cond.L.Unlock()
-}
-
-func (ri *AsyncRpcInfo) IncrementSuccessCount() {
-	ri.Cond.L.Lock()
-	if !ri.MustExit {
-		ri.SuccessCount++
-	}
-	ri.Cond.L.Unlock()
-}
-
-func (ri *AsyncRpcInfo) IncrementCurrentCount() {
-	ri.Cond.L.Lock()
-	if !ri.MustExit {
-		ri.CurrentCount++
-	}
-	ri.Cond.L.Unlock()
-	if ri.CurrentCount >= ri.TotalCount {
-		ri.Cond.Broadcast()
-	}
-}
-
-func (ri *AsyncRpcInfo) Wait() {
-	ri.Cond.L.Lock()
-	for ri.CurrentCount < ri.TotalCount && !ri.MustExit {
-		ri.Cond.Wait()
-	}
-	ri.Cond.L.Unlock()
-}
-
-func (ri *AsyncRpcInfo) SetMustExit() {
-	ri.Cond.L.Lock()
-	ri.MustExit = true
-	ri.Cond.L.Unlock()
-	ri.Cond.Broadcast()
-}
-
-func (ri *AsyncRpcInfo) SetAliveHost(index int) {
-	ri.Cond.L.Lock()
-	ri.AliveHosts[index] = true
-	ri.AliveCount++
-	ri.Cond.L.Unlock()
-}
-
-func (rf *Raft) newAsyncRpcInfo(total int) *AsyncRpcInfo {
-	ret := &AsyncRpcInfo{
-		TotalCount:   total,
-		Cond:         sync.NewCond(&sync.Mutex{}),
-		AliveHosts:   make([]bool, total),
-		AliveCount:   0,
-		SuccessCount: 0,
-		CurrentCount: 0,
-		MustExit:     false,
-	}
-	for index, _ := range ret.AliveHosts {
-		ret.AliveHosts[index] = false
-	}
-	return ret
-}
-
-func (rf *Raft) requestVoteCallBack(ok bool, peerIndex int, args *RequestVoteArgs, reply *RequestVoteReply, requestVoteInfo *AsyncRpcInfo) {
-	if !ok {
-		fmt.Println(rf.PrefixPrint(), "cannot reach peer", peerIndex, "when requesting a vote")
-	} else {
-		requestVoteInfo.IncrementAliveCount()
-		if rf.tryFollowNewerTerm(peerIndex, reply.Term) {
-			requestVoteInfo.SetMustExit()
-		} else if reply.GrantVote {
-			fmt.Println(rf.PrefixPrint(), "granted a vote by peer", peerIndex)
-			requestVoteInfo.IncrementSuccessCount()
-			if requestVoteInfo.SuccessCount+1 > requestVoteInfo.TotalCount/2 {
-				// leader claimed!
-				//fmt.Println(rf.PrefixPrint(), "got", requestVoteInfo.SuccessCount, "votes in", requestVoteInfo.AliveCount, "alive peers", requestVoteInfo.TotalCount, "total peers")
-				rf.myState = LeaderState
-				rf.votedFor = rf.me
-				//fmt.Println(rf.PrefixPrint(), "elected leader at term", rf.currentTerm)
-				rf.setLeaderNextIndex()
-				requestVoteInfo.SetMustExit()
-			}
-		}
-	}
-	requestVoteInfo.IncrementCurrentCount()
-}
-
-func (rf *Raft) sendRequestVoteAsync(
-	peerIndex int,
-	args *RequestVoteArgs,
-	reply *RequestVoteReply,
-	info *AsyncRpcInfo) {
-	go func() {
-		if info.MustExit {
-			return
-		}
-		//sendBegin := time.Now()
-		ok := rf.sendRequestVote(peerIndex, args, reply)
-		//sendEnd := time.Now()
-		//fmt.Println(rf.PrefixPrint(), "vote response from peer", peerIndex, "received in", sendEnd.Sub(sendBegin))
-		rf.requestVoteCallBack(ok, peerIndex, args, reply, info)
-	}()
-}
-
-func (rf *Raft) runElect() {
-	// must wait for a little while
-	if rf.myState != CandidateState {
-		return
-	}
-	maxRandTime := 800
-	minRandTime := 0
-	randTime := rand.Intn(maxRandTime-minRandTime) + minRandTime
-	//if randTime > (maxRandTime + minRandTime) / 2 {
-	//	maxRandTime = randTime
-	//} else {
-	//	minRandTime = randTime
-	//}
-	//fmt.Println(rf.PrefixPrint(), "running as Candidate electing in", randTime, "ms")
-	//fmt.Printf("Peer %v running as Candidate electing", rf.me)
-	time.Sleep(time.Duration(randTime) * time.Millisecond)
-	if rf.myState != CandidateState {
-		return
-	}
-
-	rf.currentTerm++
-	//rf.votedFor = rf.me
-
-	//fmt.Println(rf.PrefixPrint(), "issuing election")
-
-	//rf.mu.Lock()
-
-	args := &RequestVoteArgs{
-		Term:         rf.currentTerm,
-		CandidateId:  rf.me,
-		LastLogIndex: len(rf.logs) - 1,
-		LastLogTerm:  rf.logs[len(rf.logs)-1].Term,
-	}
-
-	//rf.mu.Unlock()
-
-	replyArray := make([]RequestVoteReply, len(rf.peers))
-	requestInfo := rf.newAsyncRpcInfo(len(rf.peers) - 1)
-	for peerIndex, _ := range rf.peers {
-		if peerIndex == rf.me {
-			// does not send to myself
-			continue
-		}
-		if rf.myState != CandidateState {
-			return
-		}
-		//fmt.Println(rf.PrefixPrint(), "requesting vote from peer", peerIndex)
-		rf.sendRequestVoteAsync(peerIndex, args, &replyArray[peerIndex], requestInfo)
-		//rf.callAsync((*Raft).requestVoteCallBack, peerIndex, "Raft.RequestVote", args, &replyArray[peerIndex], requestInfo)
-		/*
-			if rf.sendRequestVote(peerIndex, args, &replyArray[peerIndex]) {
-				aliveCount++
-				if rf.tryFollowNewerTerm(peerIndex, replyArray[peerIndex].Term) {
-					return
-				}
-				if replyArray[peerIndex].GrantVote {
-					fmt.Println(rf.PrefixPrint(), "granted a vote by peer", peerIndex)
-					voteCount++
-				}
-			} else {
-				fmt.Println(rf.PrefixPrint(), "cannot reach peer", peerIndex, "when requesting a vote")
-			}
-		*/
-	}
-	//fmt.Println(rf.PrefixPrint(), "all vote requests sent, waiting for replies")
-	//rf.requestVoteChan <- requestInfo
-	requestInfo.Wait()
-
-}
-
-func (rf *Raft) requestVoteWorker() {
-	fmt.Println(rf.PrefixPrint(), "RequestVote rpc info worker initiated")
-	for {
-		info := <-rf.requestVoteChan
-		fmt.Println(rf.PrefixPrint(), "worker checking on a collected vote info")
-		info.Cond.L.Lock()
-		if info.MustExit {
-			fmt.Println(rf.PrefixPrint(), "sees an abandoned RequestVote sending action")
-			info.Cond.L.Unlock()
-			info.Cond.Broadcast()
-			continue
-		}
-		if rf.myState == LeaderState {
-			// already elected leader
-			// ignore this info
-			fmt.Println(rf.PrefixPrint(), "already in Leader state, ignore all votes")
-			info.MustExit = true
-			info.Cond.L.Unlock()
-			info.Cond.Broadcast()
-			continue
-		}
-		fmt.Println(rf.PrefixPrint(), "got", info.SuccessCount, "votes in", info.AliveCount, "alive peers", info.TotalCount, "total peers")
-		if info.SuccessCount+1 > info.TotalCount/2 {
-			// sufficient for an leader election
-			// no need to wait longer
-			fmt.Println(rf.PrefixPrint(), "elected leader at term", rf.currentTerm)
-			rf.myState = LeaderState
-			rf.votedFor = rf.me
-			info.MustExit = true
-			info.Cond.L.Unlock()
-			info.Cond.Broadcast()
-			continue
-		} else {
-			// not all info collected
-			// must put it back
-			fmt.Println(rf.PrefixPrint(), "vote info not sufficient for a decision")
-			rf.requestVoteChan <- info
-		}
-		info.Cond.L.Unlock()
-	}
-}
-
-func (rf *Raft) PeriodCheckElect() {
-	// check clear flag every fixed period of time, avioding using go timer
-	// restart this timer if clear flag is set
-	checkCount := 200
-	divDuration := rf.electWaitDuration / checkCount
-	for {
-		//rf.mu.Lock()
-		if rf.myState != FollowerState {
-			// can only return from here
-			//rf.mu.Unlock()
-			return
-		}
-		for checkIndex := 0; checkIndex < checkCount; checkIndex++ {
-			if rf.timerCleared {
-				// restart timer
-				break
-			}
-			if rf.votedFor == -1 {
-				//fmt.Println(rf.PrefixPrint(), "has no leader, converting to a candidate")
-				rf.myState = CandidateState
-				return
-			}
-			//rf.mu.Unlock()
-			time.Sleep(time.Millisecond * time.Duration(divDuration))
-			//rf.mu.Lock()
-			if rf.myState != FollowerState {
-				return
-			}
-		}
-		if !rf.timerCleared {
-			// not brought here by a timeout event
-			// timer manually reset
-			//fmt.Println(rf.PrefixPrint(), "did not receive heartbeat signal from supposed leader peer", rf.votedFor, "in", rf.electWaitDuration, "ms, converting to a candidate")
-			// no leader now
-			rf.votedFor = -1
-			rf.myState = CandidateState
-			return
-		} else {
-			// clear clear flag
-			rf.timerCleared = false
-			// ticker continue
-		}
-		//rf.mu.Unlock()
-	}
-}
-
-/*
-func (rf *Raft) runLeader() {
-	//rf.mu.Lock()
-	args := &AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderId: rf.me,
-	}
-	//rf.mu.Unlock()
-	replyArray := make([]AppendEntriesReply, len(rf.peers))
-	for {
-		// send heart beat signal
-		aliveCount := 0
-		successCount := 0
-		for peerIndex, _ := range rf.peers {
-			if peerIndex == rf.me {
-				continue
-			}
-			fmt.Println(rf.PrefixPrint(), "sending heartbeat signal to peer", peerIndex)
-			if rf.sendAppendEntries(peerIndex, args, &replyArray[peerIndex]) {
-				aliveCount++
-				if rf.tryFollowNewerTerm(peerIndex, replyArray[peerIndex].Term) {
-					return
-				}
-				fmt.Println(rf.PrefixPrint(), "receive heartbeat response from peer", peerIndex, "success", replyArray[peerIndex].Success)
-				if replyArray[peerIndex].Success {
-					successCount++
-				}
-			} else {
-				fmt.Println(rf.PrefixPrint(), "found peer", peerIndex, "unreachable when sending heartbeats")
-			}
-		}
-		// account for itself
-		if successCount <= aliveCount / 2 {
-			// too few peers alive
-			// retreat as candidate
-			//rf.mu.Lock()
-			fmt.Println(rf.PrefixPrint(), "found", successCount, "heartbeat success peers too few for", aliveCount, "alive peers, retreating to a candidate")
-			rf.myState = CandidateState
-			//rf.mu.Unlock()
-			return
-		}
-		fmt.Println(rf.PrefixPrint(), "got", successCount, "heartbeat successes in", aliveCount, "alive peers")
-		time.Sleep(time.Millisecond * time.Duration(rf.heartBeatWaitDuration))
-	}
-}
-*/
-
-func (rf *Raft) appendEntriesCallBack(ok bool, peerIndex int, args *AppendEntriesArgs, reply *AppendEntriesReply, info *AsyncRpcInfo) {
-	if ok {
-		info.SetAliveHost(peerIndex)
-		if rf.tryFollowNewerTerm(peerIndex, reply.Term) {
-			info.SetMustExit()
-		} else {
-			// decrement and retry
-			for reply.Success == false {
-				//rf.logMutex.Lock()
-				rf.nextIndex[peerIndex]--
-				args = rf.newAppendEntriesArgs(peerIndex)
-				fmt.Println(rf.PrefixPrint(), "got false heartbeat reply from peer", peerIndex, ", must decrement nextIndex then try again")
-				//rf.logMutex.Unlock()
-				// retry
-				reply = &AppendEntriesReply{}
-				ok = rf.sendAppendEntries(peerIndex, args, reply)
-				if !ok {
-					break
-				}
-				if rf.tryFollowNewerTerm(peerIndex, reply.Term) {
-					info.SetMustExit()
-					return
-				}
-			}
-			if ok {
-				//rf.logMutex.Lock()
-				// update nextIndex, matchIndex
-				rf.nextIndex[peerIndex] += len(args.Entries)
-				rf.matchIndex[peerIndex] = rf.nextIndex[peerIndex] - 1
-				fmt.Println(rf.PrefixPrint(), "append", len(args.Entries), "to peer", peerIndex, "match", rf.matchIndex, "next", rf.nextIndex)
-				//rf.logMutex.Unlock()
-			}
-		}
-	} else {
-		//fmt.Println(rf.PrefixPrint(), "found peer", peerIndex, "unreachable when sending heartbeats")
-	}
-	info.IncrementCurrentCount()
-	if ok {
-		fmt.Println(rf.PrefixPrint(), "got reply on AppendEntries #current", info.CurrentCount, "#total", info.TotalCount)
-	} else {
-		fmt.Println(rf.PrefixPrint(), "got timeout on AppendEntries #current", info.CurrentCount, "#total", info.TotalCount)
-	}
-	/*
-		if info.CurrentCount >= info.TotalCount - 1 {
-			fmt.Println(rf.PrefixPrint(), "all heartbeat response or timeout received from #peers", info.TotalCount)
-			// try commit
-			rf.leaderTryCommit(info)
-		}
-	*/
-	rf.leaderTryCommit(info)
-}
-
-func (rf *Raft) sendAppendEntriesAsync(peerIndex int, args *AppendEntriesArgs, reply *AppendEntriesReply, info *AsyncRpcInfo) {
-	go func() {
-		if info.MustExit {
-			return
-		}
-		//sendBegin := time.Now()
-		ok := rf.sendAppendEntries(peerIndex, args, reply)
-		//sendEnd := time.Now()
-		//fmt.Println(rf.PrefixPrint(), "heartbeat response from peer", peerIndex, "received in", sendEnd.Sub(sendBegin), "success", reply.Success)
-		if info.MustExit {
-			return
-		}
-		rf.appendEntriesCallBack(ok, peerIndex, args, reply, info)
-	}()
-}
-
 func (rf *Raft) newAppendEntriesArgs(peerIndex int) *AppendEntriesArgs {
-	rf.logMutex.Lock()
+	rf.Log.Lock()
 
-	thisNextIndex := rf.nextIndex[peerIndex]
+	thisNextIndex := rf.peerLogStates.NextIndex[peerIndex]
 	var entries []LogEntry
 	prevLogIndex := -1
 	prevLogTerm := -1
-	if thisNextIndex >= len(rf.logs) {
+	if thisNextIndex >= rf.Log.Length() {
 		entries = make([]LogEntry, 0)
 	} else {
-		entries = rf.logs[thisNextIndex:len(rf.logs)]
+		entries = rf.Log.entries[thisNextIndex:]
 	}
 	if thisNextIndex != 0 {
 		prevLogIndex = thisNextIndex - 1
-		prevLogTerm = rf.logs[prevLogIndex].Term
+		prevLogTerm = rf.Log.Index(prevLogIndex).Term
 	}
 	ret := &AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
-		LeaderCommit: rf.commitIndex,
+		LeaderCommit: rf.Log.CommitIndex,
 		// index of previous entry of this sending package
 		PrevLogIndex: prevLogIndex,
 		// term of previous entry of this sending package
@@ -1095,89 +385,90 @@ func (rf *Raft) newAppendEntriesArgs(peerIndex int) *AppendEntriesArgs {
 		Entries: entries,
 	}
 
-	rf.logMutex.Unlock()
-	fmt.Println(rf.PrefixPrint(), "sending", len(ret.Entries), "new log entries to peer", peerIndex, "starting from log index", thisNextIndex)
+	rf.Log.Unlock()
 	return ret
 }
 
-func (rf *Raft) runLeader() {
-	// init nextIndex
-	for index, _ := range rf.nextIndex {
-		rf.nextIndex[index] = len(rf.logs)
+func (rf *Raft) SendAppendEntriesToAll() {
+	call := NewAppendEntriesCall(rf)
+	CallAsyncRpc(call)
+}
+
+func (rf *Raft) initiateElection() {
+	rf.votedFor = rf.me
+	rf.currentTerm++
+	call := NewRequestVoteCall(rf, rf.Log.NewRequestVoteArgs(rf.currentTerm, rf.me))
+	CallAsyncRpc(call)
+	call.Wait()
+}
+
+/*
+	peer state changes
+	public methods must be locked
+*/
+func (rf *Raft) toLeader() {
+	if rf.MyState.IsLeader() {
+		return
 	}
+	rf.printInfo("set peer state to leader")
+	rf.MyState = NewLeaderState(rf)
+	rf.votedFor = rf.me
+	rf.peerLogStates.SetAllNextIndex(rf.Log.Length())
+}
+
+func (rf *Raft) ToLeader() {
+	rf.mu.Lock()
+	rf.toLeader()
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) toFollower(peerId int) {
+	rf.printInfo("set peer state to follower")
+	rf.MyState = NewFollowerState(rf)
+	rf.votedFor = peerId
+}
+
+func (rf *Raft) ToFollower(peerId int) {
+	rf.mu.Lock()
+	rf.toFollower(peerId)
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) toCandidate() {
+	rf.MyState = NewRaftCandidate(rf)
+	rf.votedFor = -1
+	rf.printInfo("set peer state to candidate")
+}
+
+func (rf *Raft) ToCandidate() {
+	rf.mu.Lock()
+	rf.toCandidate()
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) LockPeerState() {
+	rf.mu.Lock()
+}
+
+func (rf *Raft) UnlockPeerState() {
+	rf.mu.Unlock()
+}
+
+// run state procedure
+func (rf *Raft) RunStateProcedure() {
+	rf.printInfo("state procedure runner thread started")
 	for {
-		// prepare an info instance
-		info := rf.newAsyncRpcInfo(len(rf.peers))
-		if rf.myState != LeaderState {
-			return
-		}
-		// send heartbeat signal
-		for peerIndex, _ := range rf.peers {
-			if peerIndex == rf.me {
-				continue
-			}
-			//fmt.Println(rf.PrefixPrint(), "sending heartbeat signal to peer", peerIndex)
-			// send ahead logs
-			args := rf.newAppendEntriesArgs(peerIndex)
-			rf.sendAppendEntriesAsync(peerIndex, args, &AppendEntriesReply{}, info)
-		}
-		time.Sleep(time.Millisecond * time.Duration(rf.heartBeatWaitDuration))
+		// run indefinitely
+		rf.LockPeerState()
+		rf.MyState.Run()
+		rf.UnlockPeerState()
 	}
 }
 
-func (rf *Raft) appendEntriesWorker() {
-	fmt.Println(rf.PrefixPrint(), "AppendEntries rpc info worker initiated")
+func (rf *Raft) RunAsyncProcedure() {
+	rf.printInfo("async procedure runner thread started")
 	for {
-		info := <-rf.appendEntriesChan
-		info.Cond.L.Lock()
-		if info.MustExit {
-			fmt.Println(rf.PrefixPrint(), "sees an abandoned AppendEntry sending action")
-			info.Cond.L.Unlock()
-			continue
-		}
-		if info.CurrentCount >= info.TotalCount {
-			fmt.Println(rf.PrefixPrint(), "all info on an AppendEntry rpc collected, processing by worker")
-			// all info collected
-			if info.SuccessCount <= info.AliveCount/2 {
-				// too few peers alive
-				// retreat as candidate
-				fmt.Println(rf.PrefixPrint(), "found", info.SuccessCount, "heartbeat success peers too few for", info.AliveCount, "alive peers, retreating to a candidate")
-				rf.myState = CandidateState
-				info.Cond.L.Unlock()
-				continue
-			}
-			fmt.Println(rf.PrefixPrint(), "got", info.SuccessCount, "heartbeat successes in", info.AliveCount, "alive peers")
-		} else {
-			// not all info collected
-			// must put it back
-			rf.appendEntriesChan <- info
-		}
-		info.Cond.L.Unlock()
-	}
-}
-
-func (rf *Raft) Run() {
-	//go rf.appendEntriesWorker()
-	//go rf.requestVoteWorker()
-	go rf.applyWorker()
-	//go rf.commitWorker()
-
-	for {
-		//rf.mu.Lock()
-		//fmt.Println(rf.PrefixPrint(), "taking a roll")
-		switch rf.myState {
-		case LeaderState:
-			rf.runLeader()
-			break
-		case FollowerState:
-			rf.PeriodCheckElect()
-			break
-		case CandidateState:
-			rf.runElect()
-			break
-		default:
-			panic("Invalid peer state!")
-		}
+		rf.taskQueue.RunOne()
 	}
 }
 
@@ -1194,46 +485,18 @@ func (rf *Raft) Run() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{
-		peers:     peers,
-		persister: persister,
-		me:        me,
-		applyCh:   applyCh,
-
-		commitIndex: 0,
-		lastApplied: 0,
-		nextIndex:   make([]int, len(peers)),
-		matchIndex:  make([]int, len(peers)),
-		logs:        make([]LogEntry, 1),
-
-		appendEntriesChan: make(chan *AsyncRpcInfo),
-		requestVoteChan:   make(chan *AsyncRpcInfo),
-	}
-
-	// first log entry serves uselessly
-	rf.logs[0] = LogEntry{
-		Term:    -1,
-		Command: 0,
-	}
-	// set to 0 as the paper says
-	for peerIndex := 0; peerIndex < len(peers); peerIndex++ {
-		rf.nextIndex[peerIndex] = 0
-		rf.matchIndex[peerIndex] = 0
-	}
+	rf := NewRaft(applyCh, peers, persister, me, &RaftTime{
+		TimerWaitDuration:     300,
+		HeartBeatWaitDuration: 120,
+		RequestVoteRandMax:    200,
+	})
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	rf.applyCond = sync.NewCond(&rf.logMutex)
-
-	rf.votedFor = -1
-	rf.electWaitDuration = 300
-	rf.heartBeatWaitDuration = 120
-	rf.timerCleared = false
-
-	rf.myState = FollowerState
-
-	go rf.Run()
+	go rf.RunStateProcedure()
+	go rf.RunAsyncProcedure()
+	go rf.Log.ApplyWorker()
 
 	return rf
 }
