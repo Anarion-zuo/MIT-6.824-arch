@@ -15,11 +15,20 @@ func NewRequestVoteCall(raft *Raft, args *RequestVoteArgs) *RequestVoteCall {
 	}
 }
 
+func (rvc *RequestVoteCall) shouldExit() bool {
+	if rvc.MustExit {
+		return true
+	}
+	return false
+}
+
 func (rvc *RequestVoteCall) makeRpcCall(peerIndex int) bool {
+	rvc.raft.printInfo("sending RequestVote to peer", peerIndex)
 	return rvc.peers[peerIndex].Call("Raft.RequestVote", rvc.args, &rvc.replies[peerIndex])
 }
 
 func (rvc *RequestVoteCall) callback(peerIndex int) {
+	rvc.raft.printInfo("RequestVote reply received from peer", peerIndex)
 	if !rvc.raft.MyState.IsCandidate() {
 		rvc.SetMustExit()
 		return
@@ -36,14 +45,19 @@ func (rvc *RequestVoteCall) callback(peerIndex int) {
 }
 
 func (rvc *RequestVoteCall) tryEnd() bool {
-	if rvc.SuccessCount+1 > rvc.TotalCount/2 {
+	if rvc.SuccessCount > rvc.TotalCount/2 {
 		rvc.raft.printInfo("#granted", rvc.SuccessCount, "in #total", rvc.TotalCount)
 		rvc.SetMustExit()
 		// change raft state
 		rvc.raft.toLeader()
 		return true
 	}
-	if rvc.CurrentCount+1 >= rvc.TotalCount {
+	if rvc.SuccessCount+rvc.TotalCount-rvc.CurrentCount <= rvc.TotalCount/2 {
+		rvc.SetMustExit()
+		rvc.raft.printInfo("#granted", rvc.SuccessCount, "too few for #total - #current", rvc.TotalCount-rvc.CurrentCount)
+		return true
+	}
+	if rvc.CurrentCount >= rvc.TotalCount {
 		rvc.raft.printInfo("#granted", rvc.SuccessCount, "too few for #total", rvc.TotalCount)
 		rvc.SetMustExit()
 		return true

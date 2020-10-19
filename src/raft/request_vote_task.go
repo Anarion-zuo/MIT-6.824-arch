@@ -21,37 +21,37 @@ func (rvt *RequestVoteTask) printGrantVote(peerId int) {
 func (rvt *RequestVoteTask) grantVote(peerId int, reply *RequestVoteReply) {
 	reply.GrantVote = true
 	rvt.raft.toFollower(peerId)
+	rvt.raft.TimeParams.heartBeatTimer.SetClear()
 }
 
 func (rvt *RequestVoteTask) executeRequestVoteRpc(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rvt.raft.currentTerm
 	reply.GrantVote = false
-	rvt.raft.TimeParams.SetClear()
 
 	if args.Term < rvt.raft.currentTerm {
 		return
 	}
 	if rvt.raft.tryFollowNewerTerm(args.CandidateId, args.Term) {
-		rvt.raft.printInfo("sees an old term request vote from peer", args.CandidateId)
+		rvt.raft.printInfo("sees newer term RequestVote from peer", args.CandidateId)
 		rvt.grantVote(args.CandidateId, reply)
 		return
 	}
 	// decide vote
 	if rvt.raft.votedFor < 0 || rvt.raft.votedFor == args.CandidateId {
 		// check up-to-date
-		if rvt.raft.Log.LastEntry().Term > args.LastLogTerm {
-			// this peer has more up-to-date Log
-			rvt.printThisMoreUpToDate()
-			return
-		}
 		if rvt.raft.Log.LastEntry().Term < args.LastLogTerm {
 			// that peer has more up-to-date Log
 			rvt.grantVote(args.CandidateId, reply)
 			rvt.printGrantVote(args.CandidateId)
 			return
 		}
+		if rvt.raft.Log.LastEntry().Term > args.LastLogTerm {
+			// this peer has more up-to-date Log
+			rvt.printThisMoreUpToDate()
+			return
+		}
 		// Term attribute equals, comparing length
-		if args.LastLogIndex < rvt.raft.Log.Length()-1 {
+		if args.LastLogIndex <= rvt.raft.Log.Length()-1 {
 			// this peer is more up-to-date
 			rvt.printThisMoreUpToDate()
 			return

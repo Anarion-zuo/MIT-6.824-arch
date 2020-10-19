@@ -12,24 +12,57 @@ func (aec *AppendEntriesCall) makeRpcCall(peerIndex int) bool {
 	return aec.peers[peerIndex].Call("Raft.AppendEntries", &aec.args[peerIndex], &aec.replies[peerIndex])
 }
 
+func (aec *AppendEntriesCall) shouldExit() bool {
+	if aec.MustExit {
+		return true
+	}
+	return false
+}
+
 func (aec *AppendEntriesCall) callback(peerIndex int) {
+	if !aec.raft.MyState.IsLeader() {
+		aec.SetMustExit()
+		return
+	}
 	aec.raft.printInfo("heartbeat received from peer", peerIndex)
 	reply := &aec.replies[peerIndex]
 	if aec.raft.tryFollowNewerTerm(peerIndex, reply.Term) {
 		aec.SetMustExit()
 		return
 	}
-	if reply.Success {
-		aec.raft.peerLogStates.More(peerIndex, len(aec.args[peerIndex].Entries))
-	} else {
+	aec.raft.printInfo("peer", peerIndex, "received", len(aec.args[peerIndex].Entries), "entries")
+	for reply.Success == false {
 		aec.raft.peerLogStates.Less(peerIndex)
+		/*
+			nextIndex := aec.raft.Log.lastTermIndex(0, reply.ConflictTerm)
+			if nextIndex == -1 {
+				aec.raft.peerLogStates.NextIndex[peerIndex] = reply.ConflictIndex
+			} else {
+				aec.raft.peerLogStates.NextIndex[peerIndex] = nextIndex
+			}
+		*/
+		aec.raft.printInfo("peer", peerIndex, "refused entries sent, must decrement nextIndex to", aec.raft.peerLogStates.NextIndex[peerIndex])
+		ok := aec.makeRpcCall(peerIndex)
+		if ok == false {
+			return
+		}
+		if !aec.raft.MyState.IsLeader() {
+			aec.SetMustExit()
+			return
+		}
+		if aec.raft.tryFollowNewerTerm(peerIndex, reply.Term) {
+			aec.SetMustExit()
+			return
+		}
 	}
+	aec.raft.peerLogStates.More(peerIndex, len(aec.args[peerIndex].Entries))
+	aec.raft.printInfo("peer", peerIndex, "log updated to", aec.raft.peerLogStates.matchIndex[peerIndex])
 }
 
 func (aec *AppendEntriesCall) tryEnd() bool {
-	if aec.CurrentCount+1 >= aec.TotalCount {
-		aec.raft.TryCommit(aec)
+	if aec.CurrentCount >= aec.TotalCount {
 		aec.SetMustExit()
+		aec.raft.TryCommit(aec)
 		return true
 	}
 	return false

@@ -5,28 +5,18 @@ import (
 	"time"
 )
 
-type RaftTime struct {
-	// waits
-	HeartBeatWaitDuration int
-	RequestVoteRandMax    int
-
-	// timer
-	TimerWaitDuration int
-	TimerCleared      bool
+type RaftTimer struct {
+	WaitDuration int
+	TimerCleared bool
 }
 
-func (rt *RaftTime) WaitHeartBeat() {
-	time.Sleep(time.Millisecond * time.Duration(rt.HeartBeatWaitDuration))
+func (rt *RaftTimer) SetClear() {
+	rt.TimerCleared = true
 }
 
-func (rt *RaftTime) WaitRandomRequestVote() {
-	time.Sleep(time.Duration(rand.Intn(rt.RequestVoteRandMax)))
-}
-
-// returns true when expired
-func (rt *RaftTime) WaitTimer() bool {
+func (rt *RaftTimer) Wait() bool {
 	checkCount := 200
-	divDuration := rt.TimerWaitDuration / checkCount
+	divDuration := rt.WaitDuration / checkCount
 	for checkIndex := 0; checkIndex < checkCount; checkIndex++ {
 		if rt.TimerCleared {
 			// not expired
@@ -40,6 +30,36 @@ func (rt *RaftTime) WaitTimer() bool {
 	return ret
 }
 
-func (rt *RaftTime) SetClear() {
-	rt.TimerCleared = true
+func NewRaftTimer(waitDuration int) RaftTimer {
+	return RaftTimer{
+		WaitDuration: waitDuration,
+		TimerCleared: false,
+	}
+}
+
+type RaftTime struct {
+	// waits
+	heartBeatSendWait  int
+	requestVoteRandMax int
+
+	// timer
+	heartBeatTimer RaftTimer
+	//electionTimer RaftTimer
+}
+
+func (rt *RaftTime) WaitHeartBeat() {
+	time.Sleep(time.Millisecond * time.Duration(rt.heartBeatSendWait))
+}
+
+func (rt *RaftTime) WaitRandomRequestVote() {
+	time.Sleep(time.Duration(rand.Intn(rt.requestVoteRandMax)))
+}
+
+func NewRaftTime(heartBeatSendWait, electionRandMax, heartBeatWaitMax int) *RaftTime {
+	return &RaftTime{
+		heartBeatSendWait:  heartBeatSendWait,
+		requestVoteRandMax: electionRandMax,
+		heartBeatTimer:     NewRaftTimer(heartBeatWaitMax),
+		//electionTimer:      NewRaftTimer(electionWaitMax),
+	}
 }

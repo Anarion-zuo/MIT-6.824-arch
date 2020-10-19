@@ -13,7 +13,7 @@ func (aet *AppendEntriesTask) execute() {
 func (aet *AppendEntriesTask) executeAppendEntriesRpc(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	reply.Term = aet.raft.currentTerm
 	reply.Success = true
-	aet.raft.TimeParams.SetClear()
+	aet.raft.printInfo("heartbeat received from peer", args.LeaderId)
 
 	// ignore old terms
 	if aet.raft.currentTerm > args.Term {
@@ -24,9 +24,12 @@ func (aet *AppendEntriesTask) executeAppendEntriesRpc(args *AppendEntriesArgs, r
 	if aet.raft.tryFollowNewerTerm(args.LeaderId, args.Term) {
 
 	}
+	aet.raft.TimeParams.heartBeatTimer.SetClear()
 	if args.PrevLogIndex >= aet.raft.Log.Length() {
 		reply.Success = false
 		aet.raft.printInfo("new entries to log index", args.PrevLogIndex, "too large")
+		reply.ConflictIndex = aet.raft.Log.Length()
+		reply.ConflictTerm = -1
 		return
 	}
 	if args.PrevLogIndex != -1 {
@@ -34,12 +37,14 @@ func (aet *AppendEntriesTask) executeAppendEntriesRpc(args *AppendEntriesArgs, r
 		if aet.raft.Log.Index(args.PrevLogIndex).Term != args.PrevLogTerm {
 			reply.Success = false
 			aet.raft.printInfo("new entries term", args.PrevLogTerm, "not consistent with this peer's previous log entry term", aet.raft.Log.Index(args.PrevLogIndex).Term)
+			reply.ConflictTerm = aet.raft.Log.Index(args.PrevLogIndex).Term
+			reply.ConflictIndex = aet.raft.Log.firstTermIndex(args.PrevLogIndex, reply.ConflictTerm)
 			return
 		}
 	}
 	// here the log can be updated
+	aet.raft.printInfo("trying to append #entries", len(args.Entries))
 	aet.raft.Log.UpdateLog(args.Entries, args.PrevLogIndex, args.LeaderCommit)
-	aet.raft.printInfo("log committed to", aet.raft.Log.CommitIndex)
 	// extra modifications done under candidate
 	if aet.raft.MyState.IsCandidate() {
 		aet.raft.currentTerm = args.Term

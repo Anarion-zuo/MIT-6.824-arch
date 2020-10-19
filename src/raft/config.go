@@ -174,6 +174,7 @@ func (cfg *config) start1(i int) {
 			} else {
 				v := m.Command
 				cfg.mu.Lock()
+				//fmt.Println("[monitor] sees a committed Command", m.Command, "valid", m.CommandValid, "index", m.CommandIndex)
 				for j := 0; j < len(cfg.logs); j++ {
 					if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v {
 						// some server has already committed a different value for this entry!
@@ -359,7 +360,7 @@ func (cfg *config) checkNoLeader() {
 	}
 }
 
-// how many servers think a log entry is committed?
+// how many servers think a Log entry is committed?
 func (cfg *config) nCommitted(index int) (int, interface{}) {
 	count := 0
 	var cmd interface{} = nil
@@ -473,6 +474,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 		}
 	}
 	cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
+
 	return -1
 }
 

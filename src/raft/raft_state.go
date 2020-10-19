@@ -139,9 +139,9 @@ func (rf *Raft) runLeader() {
 */
 
 func (follower *RaftFollower) Run() {
-	follower.raft.printInfo("begin waiting for", follower.raft.TimeParams.HeartBeatWaitDuration, "ms")
+	follower.raft.printInfo("begin waiting for", follower.raft.TimeParams.heartBeatSendWait, "ms")
 	follower.raft.UnlockPeerState()
-	if follower.raft.TimeParams.WaitTimer() {
+	if follower.raft.TimeParams.heartBeatTimer.Wait() {
 		follower.raft.LockPeerState()
 		// timer expired
 		follower.raft.printInfo("timer expired, becoming candidate")

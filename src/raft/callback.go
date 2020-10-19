@@ -19,6 +19,7 @@ type AsyncRpcCallInterface interface {
 	UnlockCallBack()
 
 	GetRaftIndex() int
+	GetRaft() *Raft
 }
 
 /*
@@ -45,6 +46,8 @@ func CallAsyncRpc(call AsyncRpcCallInterface) {
 			if ok {
 				call.SetAliveHost(peerIndex)
 				call.callback(peerIndex)
+			} else {
+				call.GetRaft().printInfo("rpc to peer", peerIndex, "timeout")
 			}
 			if call.tryEnd() {
 				call.UnlockCallBack()
@@ -75,29 +78,28 @@ func (ri *AsyncRpcCallAttr) PeerCount() int {
 }
 
 func (ri *AsyncRpcCallAttr) IncrementAliveCount() {
-	if !ri.MustExit {
-		ri.AliveCount++
-	}
+	ri.AliveCount++
 }
 
 func (ri *AsyncRpcCallAttr) IncrementSuccessCount() {
-	if !ri.MustExit {
-		ri.SuccessCount++
-	}
+	ri.SuccessCount++
 }
 
 func (ri *AsyncRpcCallAttr) IncrementCurrentCount() {
-	if !ri.MustExit {
-		ri.CurrentCount++
-	}
+	ri.Cond.L.Lock()
+	ri.CurrentCount++
+	ri.Cond.L.Unlock()
+	ri.Cond.Broadcast()
 }
 
 func (ri *AsyncRpcCallAttr) Wait() {
+	ri.raft.printInfo("waiting for election done")
 	ri.Cond.L.Lock()
-	for ri.CurrentCount < ri.TotalCount && !ri.MustExit {
+	for !(ri.CurrentCount >= ri.TotalCount || ri.MustExit) {
 		ri.Cond.Wait()
 	}
 	ri.Cond.L.Unlock()
+	ri.raft.printInfo("election done wait exit")
 }
 
 func (ri *AsyncRpcCallAttr) SetMustExit() {
@@ -128,18 +130,22 @@ func (ri *AsyncRpcCallAttr) GetRaftIndex() int {
 	return ri.raft.me
 }
 
+func (ri *AsyncRpcCallAttr) GetRaft() *Raft {
+	return ri.raft
+}
+
 func (rf *Raft) NewAsyncRpcCall() AsyncRpcCallAttr {
 	aliveHosts := make([]bool, len(rf.peers))
 	for index, _ := range aliveHosts {
 		aliveHosts[index] = false
 	}
 	return AsyncRpcCallAttr{
-		TotalCount:   len(rf.peers),
+		TotalCount:   rf.PeerCount(),
 		Cond:         sync.NewCond(&sync.Mutex{}),
 		AliveHosts:   aliveHosts,
-		AliveCount:   0,
-		SuccessCount: 0,
-		CurrentCount: 0,
+		AliveCount:   1,
+		SuccessCount: 1,
+		CurrentCount: 1,
 		MustExit:     false,
 		peers:        rf.peers,
 		raft:         rf,

@@ -49,6 +49,6 @@ func (pls *PeerLogStates) More(peerIndex int, moreNextIndex int) {
 
 func (pls *PeerLogStates) Less(peerIndex int) {
 	pls.mutex.Lock()
-	pls.NextIndex[peerIndex]--
+	pls.NextIndex[peerIndex] /= 2
 	pls.mutex.Unlock()
 }

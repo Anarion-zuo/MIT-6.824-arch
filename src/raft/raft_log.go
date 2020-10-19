@@ -15,10 +15,10 @@ func (le *LogEntry) Equals(entry *LogEntry) bool {
 	return le.Term == entry.Term && le.Command == entry.Command
 }
 
-func (le *LogEntry) ToApplyMsg(index int) ApplyMsg {
+func (le *LogEntry) ToApplyMsg(index int, valid bool) ApplyMsg {
 	return ApplyMsg{
 		Command:      le.Command,
-		CommandValid: true,
+		CommandValid: valid,
 		CommandIndex: index,
 	}
 }
@@ -29,6 +29,8 @@ type RaftLog struct {
 	entries     []LogEntry
 	cond        *sync.Cond
 	applyCh     chan ApplyMsg
+
+	raft *Raft
 }
 
 func initRaftLogEntries() []LogEntry {
@@ -38,13 +40,14 @@ func initRaftLogEntries() []LogEntry {
 	return ret
 }
 
-func NewRaftLog(applyCh chan ApplyMsg) *RaftLog {
+func NewRaftLog(applyCh chan ApplyMsg, raft *Raft) *RaftLog {
 	return &RaftLog{
 		CommitIndex: 0,
 		lastApplied: 0,
 		entries:     initRaftLogEntries(),
 		cond:        sync.NewCond(&sync.Mutex{}),
 		applyCh:     applyCh,
+		raft:        raft,
 	}
 }
 
@@ -58,12 +61,12 @@ func (rl *RaftLog) dump() {
 	dumpLock.Lock()
 	fmt.Println("dumping log", rl.Length())
 	fmt.Println("log length", rl.Length(), "commit index", rl.CommitIndex)
-	for entryIndex, entry := range rl.entries {
-		fmt.Printf("%v term: %v action: %v\n", entryIndex, entry.Term, entry.Command)
-		if entryIndex == rl.CommitIndex {
-			fmt.Println("----------------------------------- commit index", entryIndex)
-		}
-	}
+	//for entryIndex, entry := range rl.entries {
+	//	fmt.Printf("%v term: %v action: %v\n", entryIndex, entry.Term, entry.Command)
+	//	if entryIndex == rl.CommitIndex {
+	//		fmt.Println("----------------------------------- commit index", entryIndex)
+	//	}
+	//}
 	dumpLock.Unlock()
 }
 
@@ -96,6 +99,24 @@ func (rl *RaftLog) Length() int {
 	return len(rl.entries)
 }
 
+func (rl *RaftLog) firstTermIndex(beginIndex int, term int) int {
+	for ; beginIndex > 1; beginIndex-- {
+		if rl.entries[beginIndex-1].Term != term {
+			return beginIndex
+		}
+	}
+	return 1
+}
+
+func (rl *RaftLog) lastTermIndex(beginIndex int, term int) int {
+	for ; beginIndex < rl.Length()-1; beginIndex++ {
+		if rl.entries[beginIndex].Term == term && rl.entries[beginIndex+1].Term != term {
+			return beginIndex + 1
+		}
+	}
+	return -1
+}
+
 /*
 	From now on, the methods are locked.
 	The methods above can compose, by some outer caller, other form of methods, locking taken care of by the outer caller
@@ -126,15 +147,18 @@ func (rl *RaftLog) UpdateLog(newEntries []LogEntry, prevLogIndex int, leaderComm
 			// check for conflict
 			if oldEntry.Equals(newEntry) {
 				// consistent!
+				rl.raft.printInfo("existing consistent entry", newEntryIndex)
 				argsEntryIndex++
 			} else {
 				// inconsistent!
 				// delete everything after current index
+				rl.raft.printInfo("inconsistent entry at index", newEntryIndex)
 				rl.RemoveAt(newEntryIndex)
 			}
 		} else {
 			// new Log
 			// append everything
+			rl.raft.printInfo("new entries at", newEntryIndex, "length", len(newEntries)-argsEntryIndex)
 			rl.Append(newEntries[argsEntryIndex:]...)
 			break
 		}
@@ -151,7 +175,7 @@ func (rl *RaftLog) UpdateLog(newEntries []LogEntry, prevLogIndex int, leaderComm
 			if oldCommitIndex == 0 {
 				continue
 			}
-			rl.applyCh <- rl.entries[oldCommitIndex].ToApplyMsg(oldCommitIndex)
+			rl.applyCh <- rl.entries[oldCommitIndex].ToApplyMsg(oldCommitIndex, true)
 		}
 	}
 

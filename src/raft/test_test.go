@@ -378,6 +378,7 @@ func TestBackup2B(t *testing.T) {
 	cfg.one(rand.Int(), servers, true)
 
 	// put leader and one follower in a partition
+	fmt.Println("[monitor] put leader and one follower in a partition")
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect((leader1 + 2) % servers)
 	cfg.disconnect((leader1 + 3) % servers)
@@ -394,6 +395,7 @@ func TestBackup2B(t *testing.T) {
 	cfg.disconnect((leader1 + 1) % servers)
 
 	// allow other partition to recover
+	fmt.Println("[monitor] allow other partition to recover")
 	cfg.connect((leader1 + 2) % servers)
 	cfg.connect((leader1 + 3) % servers)
 	cfg.connect((leader1 + 4) % servers)
@@ -404,6 +406,7 @@ func TestBackup2B(t *testing.T) {
 	}
 
 	// now another partitioned leader and one follower
+	fmt.Println("[monitor] now another partitioned leader and one follower")
 	leader2 := cfg.checkOneLeader()
 	other := (leader1 + 2) % servers
 	if leader2 == other {
@@ -419,12 +422,14 @@ func TestBackup2B(t *testing.T) {
 	time.Sleep(RaftElectionTimeout / 2)
 
 	// bring original leader back to life,
+	fmt.Println("[monitor] bring original leader back to life")
 	for i := 0; i < servers; i++ {
 		cfg.disconnect(i)
 	}
 	cfg.connect((leader1 + 0) % servers)
 	cfg.connect((leader1 + 1) % servers)
 	cfg.connect(other)
+	time.Sleep(200 * time.Millisecond)
 
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
@@ -432,9 +437,11 @@ func TestBackup2B(t *testing.T) {
 	}
 
 	// now everyone
+	fmt.Println("[monitor] now everyone")
 	for i := 0; i < servers; i++ {
 		cfg.connect(i)
 	}
+	fmt.Println("[monitor] disconnected brought back")
 	cfg.one(rand.Int(), servers, true)
 
 	cfg.end()
@@ -675,11 +682,11 @@ func TestPersist32C(t *testing.T) {
 //
 // Test the scenarios described in Figure 8 of the extended Raft paper. Each
 // iteration asks a leader, if there is one, to insert a command in the Raft
-// log.  If there is a leader, that leader will fail quickly with a high
+// Log.  If there is a leader, that leader will fail quickly with a high
 // probability (perhaps without committing the command), or crash after a while
 // with low probability (most likey committing the command).  If the number of
 // alive servers isn't enough to form a majority, perhaps start a new server.
-// The leader in a new term may try to finish replicating log entries that
+// The leader in a new term may try to finish replicating Log entries that
 // haven't been committed yet.
 //
 func TestFigure82C(t *testing.T) {

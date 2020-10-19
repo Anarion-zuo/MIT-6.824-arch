@@ -95,13 +95,12 @@ func NewRaft(applyCh chan ApplyMsg, peers []*labrpc.ClientEnd, persister *Persis
 		currentTerm: 0,
 		votedFor:    -1, // voted for no one
 		taskQueue:   NewRaftTaskQueue(),
-		MyState:     NewFollowerState(nil),
-		Log:         NewRaftLog(applyCh),
 
 		peerLogStates: NewPeerLogStates(peerCount),
 		TimeParams:    timeParams,
 	}
 	ret.MyState = NewFollowerState(ret)
+	ret.Log = NewRaftLog(applyCh, ret)
 	return ret
 }
 
@@ -169,6 +168,7 @@ func (rf *Raft) PeerCount() int {
 func (rf *Raft) tryFollowNewerTerm(candidateId int, newTerm int) bool {
 	if rf.currentTerm < newTerm {
 		//fmt.Println(rf.PrefixPrint(), "sees newer term", newTerm, "from peer", candidateId)
+		rf.printInfo("sees a newer term", newTerm)
 		rf.currentTerm = newTerm
 		rf.toFollower(candidateId)
 		return true
@@ -187,18 +187,22 @@ func (rf *Raft) tryDiscardOldTerm(peerId int, oldTerm int) bool {
 func (rf *Raft) TryCommit(call *AppendEntriesCall) {
 	rf.Log.Lock()
 	rf.peerLogStates.Lock()
+	oldCommit := rf.Log.CommitIndex
+	rf.printInfo("trying to commit new entries")
 	for {
 		testCommitIndex := rf.Log.CommitIndex + 1
 		if testCommitIndex >= rf.Log.Length() {
+			rf.printInfo("all present entries committed")
 			break
 		}
-		if call.AliveCount+1 <= call.TotalCount/2 {
+		if call.AliveCount <= call.TotalCount/2 {
+			rf.printInfo("#alive", call.AliveCount, "too few for #total", call.TotalCount, "to reach an agreement")
 			break
 		}
-		trueCount := 0
+		rf.printInfo("#alive", call.AliveCount, "sufficient for #total", call.TotalCount, "to reach an agreement")
+		trueCount := 1
 		for peerIndex, matchIndex := range rf.peerLogStates.matchIndex {
 			if peerIndex == rf.me {
-				trueCount++
 				continue
 			}
 			if call.AliveHosts[peerIndex] {
@@ -208,9 +212,11 @@ func (rf *Raft) TryCommit(call *AppendEntriesCall) {
 				}
 			}
 		}
-		if trueCount <= call.AliveCount/2 {
+		if trueCount <= call.TotalCount/2 {
+			rf.printInfo("#consistent", trueCount, "too few for #alive", call.AliveCount)
 			break
 		}
+		rf.printInfo("#consistent", trueCount, "sufficient for #alive", call.AliveCount)
 		if rf.Log.Index(testCommitIndex).Term != rf.currentTerm {
 			// discard uncommitted logs
 			rf.Log.RemoveAt(testCommitIndex)
@@ -220,10 +226,17 @@ func (rf *Raft) TryCommit(call *AppendEntriesCall) {
 					rf.peerLogStates.NextIndex[peerIndex] = rf.Log.CommitIndex
 				}
 			}
+			rf.printInfo("discards inconsistent term entries starting", testCommitIndex)
 			break
 		}
 		rf.Log.CommitIndex = testCommitIndex
-		rf.Log.applyCh <- rf.Log.Index(rf.Log.CommitIndex).ToApplyMsg(rf.Log.CommitIndex)
+		//rf.Log.applyCh <- rf.Log.Index(rf.Log.CommitIndex).ToApplyMsg(rf.Log.CommitIndex, true)
+		rf.printInfo("new entry committed command", rf.Log.Index(rf.Log.CommitIndex).Command)
+	}
+	if rf.Log.CommitIndex > oldCommit {
+		for ; oldCommit <= rf.Log.CommitIndex; oldCommit++ {
+			rf.Log.applyCh <- rf.Log.Index(oldCommit).ToApplyMsg(oldCommit, true)
+		}
 	}
 	rf.peerLogStates.Unlock()
 	rf.Log.Unlock()
@@ -384,7 +397,7 @@ func (rf *Raft) newAppendEntriesArgs(peerIndex int) *AppendEntriesArgs {
 		// sending package
 		Entries: entries,
 	}
-
+	rf.printInfo("sending", len(entries), "entries to peer", peerIndex, "at nextIndex", thisNextIndex)
 	rf.Log.Unlock()
 	return ret
 }
@@ -400,6 +413,7 @@ func (rf *Raft) initiateElection() {
 	call := NewRequestVoteCall(rf, rf.Log.NewRequestVoteArgs(rf.currentTerm, rf.me))
 	CallAsyncRpc(call)
 	call.Wait()
+	//time.Sleep(time.Duration(rf.TimeParams.requestVoteRandMax) * time.Millisecond)
 }
 
 /*
@@ -485,11 +499,13 @@ func (rf *Raft) RunAsyncProcedure() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := NewRaft(applyCh, peers, persister, me, &RaftTime{
-		TimerWaitDuration:     300,
-		HeartBeatWaitDuration: 120,
-		RequestVoteRandMax:    200,
-	})
+	rf := NewRaft(
+		applyCh,
+		peers,
+		persister,
+		me,
+		NewRaftTime(80, 200, 500),
+	)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
